@@ -1,4 +1,7 @@
-torch
-torchvision
-torchaudio
+# torch
+# torchvision
+# torchaudio
 pandas
+fugashi
+wandb
+unidic-lite
