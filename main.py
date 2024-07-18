@@ -2,6 +2,10 @@ import re
 import random
 import time
 from statistics import mode
+import wandb
+import torch.optim as optim
+import os
+from torch.utils.data import DataLoader
 
 from PIL import Image
 import numpy as np
@@ -10,6 +14,10 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
+from transformers import AutoTokenizer, AutoModel
+import torch.nn.functional as F
+from tqdm import tqdm
+
 
 
 def set_seed(seed):
@@ -21,158 +29,86 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
 def process_text(text):
-    # lowercase
+    # 既存の処理に加えて
     text = text.lower()
-
-    # 数詞を数字に変換
-    num_word_to_digit = {
-        'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
-        'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
-        'ten': '10'
-    }
-    for word, digit in num_word_to_digit.items():
-        text = text.replace(word, digit)
-
-    # 小数点のピリオドを削除
-    text = re.sub(r'(?<!\d)\.(?!\d)', '', text)
-
-    # 冠詞の削除
     text = re.sub(r'\b(a|an|the)\b', '', text)
+    return text.strip()
 
-    # 短縮形のカンマの追加
-    contractions = {
-        "dont": "don't", "isnt": "isn't", "arent": "aren't", "wont": "won't",
-        "cant": "can't", "wouldnt": "wouldn't", "couldnt": "couldn't"
-    }
-    for contraction, correct in contractions.items():
-        text = text.replace(contraction, correct)
+class JapaneseBERTEncoder:
+    def __init__(self, model_name='cl-tohoku/bert-base-japanese-v2'):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.model.eval()
 
-    # 句読点をスペースに変換
-    text = re.sub(r"[^\w\s':]", ' ', text)
-
-    # 句読点をスペースに変換
-    text = re.sub(r'\s+,', ',', text)
-
-    # 連続するスペースを1つに変換
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    return text
+    def encode(self, sentences, device='cuda'):
+        self.model = self.model.to(device)  # モデルを指定されたデバイスに移動
+        encoded_input = self.tokenizer(sentences, padding=True, truncation=True, max_length=512, return_tensors='pt')
+        encoded_input = {k: v.to(device) for k, v in encoded_input.items()}  # 入力をデバイスに移動
+        with torch.no_grad():
+            model_output = self.model(**encoded_input)
+        return model_output.last_hidden_state[:, 0, :]  # CLS token
 
 
-# 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
     def __init__(self, df_path, image_dir, transform=None, answer=True):
-        self.transform = transform  # 画像の前処理
-        self.image_dir = image_dir  # 画像ファイルのディレクトリ
-        self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
+        self.transform = transform
+        self.image_dir = image_dir
+        self.df = pandas.read_json(df_path)
         self.answer = answer
 
-        # question / answerの辞書を作成
-        self.question2idx = {}
-        self.answer2idx = {}
-        self.idx2question = {}
-        self.idx2answer = {}
+        # HuggingFaceのclass_mappingを使用
+        self.class_mapping = pandas.read_csv('https://huggingface.co/spaces/CVPR/VizWiz-CLIP-VQA/raw/main/data/annotations/class_mapping.csv')
+        self.answer2idx = {row['answer']: row['class_id'] for _, row in self.class_mapping.iterrows()}
+        self.idx2answer = {v: k for k, v in self.answer2idx.items()}
 
-        # 質問文に含まれる単語を辞書に追加
-        for question in self.df["question"]:
-            question = process_text(question)
-            words = question.split(" ")
-            for word in words:
-                if word not in self.question2idx:
-                    self.question2idx[word] = len(self.question2idx)
-        self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
-
-        if self.answer:
-            # 回答に含まれる単語を辞書に追加
-            for answers in self.df["answers"]:
-                for answer in answers:
-                    word = answer["answer"]
-                    word = process_text(word)
-                    if word not in self.answer2idx:
-                        self.answer2idx[word] = len(self.answer2idx)
-            self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
+        # 質問文の処理は不要になります（BERTが処理するため）
 
     def update_dict(self, dataset):
-        """
-        検証用データ，テストデータの辞書を訓練データの辞書に更新する．
 
-        Parameters
-        ----------
-        dataset : Dataset
-            訓練データのDataset
-        """
-        self.question2idx = dataset.question2idx
         self.answer2idx = dataset.answer2idx
-        self.idx2question = dataset.idx2question
         self.idx2answer = dataset.idx2answer
 
     def __getitem__(self, idx):
-        """
-        対応するidxのデータ（画像，質問，回答）を取得．
-
-        Parameters
-        ----------
-        idx : int
-            取得するデータのインデックス
-
-        Returns
-        -------
-        image : torch.Tensor  (C, H, W)
-            画像データ
-        question : torch.Tensor  (vocab_size)
-            質問文をone-hot表現に変換したもの
-        answers : torch.Tensor  (n_answer)
-            10人の回答者の回答のid
-        mode_answer_idx : torch.Tensor  (1)
-            10人の回答者の回答の中で最頻値の回答のid
-        """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
+        question = process_text(self.df["question"][idx])  # 前処理のみ行い、エンコードはしない
 
         if self.answer:
-            answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
-            mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
+            answers = [self.answer2idx.get(process_text(answer["answer"]), -1) for answer in self.df["answers"][idx]]
+            answers = [a for a in answers if a != -1]  # 未知の回答を除外
+            mode_answer_idx = mode(answers) if answers else -1
 
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
-
+            return image, question, torch.Tensor(answers), int(mode_answer_idx)
         else:
-            return image, torch.Tensor(question)
+            return image, question
 
     def __len__(self):
         return len(self.df)
 
-
 # 2. 評価指標の実装
 # 簡単にするならBCEを利用する
-def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
-    total_acc = 0.
+# def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
+#     total_acc = 0.
 
-    for pred, answers in zip(batch_pred, batch_answers):
-        acc = 0.
-        for i in range(len(answers)):
-            num_match = 0
-            for j in range(len(answers)):
-                if i == j:
-                    continue
-                if pred == answers[j]:
-                    num_match += 1
-            acc += min(num_match / 3, 1)
-        total_acc += acc / 10
+#     for pred, answers in zip(batch_pred, batch_answers):
+#         acc = 0.
+#         for i in range(len(answers)):
+#             num_match = 0
+#             for j in range(len(answers)):
+#                 if i == j:
+#                     continue
+#                 if pred == answers[j]:
+#                     num_match += 1
+#             acc += min(num_match / 3, 1)
+#         total_acc += acc / 10
 
-    return total_acc / len(batch_pred)
+#     return total_acc / len(batch_pred)
 
 
-# 3. モデルのの実装
-# ResNetを利用できるようにしておく
+
+
+# ResNet
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -286,124 +222,293 @@ def ResNet18():
 def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
-
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, n_answer: int):
         super().__init__()
-        self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
-
-        self.fc = nn.Sequential(
+        self.resnet = ResNet50()
+        self.text_encoder = JapaneseBERTEncoder()
+        
+        sentence_embedding_dim = 768
+        image_feature_dim = 512  # ResNet50の最後の全結合層の出力次元
+        
+        self.fusion = nn.Sequential(
+            nn.Linear(image_feature_dim + sentence_embedding_dim, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.5),
             nn.Linear(1024, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, n_answer)
+            nn.ReLU(),
+            nn.Dropout(0.5)
         )
+        
+        self.classifier = nn.Linear(512, n_answer)
 
     def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+        image_feature = self.resnet(image)
+        question_feature = self.text_encoder.encode(question, device=image.device)
+        
+        # 画像特徴量と質問特徴量を結合
+        combined = torch.cat([image_feature, question_feature], dim=1)
+        
+        # 特徴量の融合
+        fused = self.fusion(combined)
+        
+        # 分類
+        logits = self.classifier(fused)
 
-        x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(x)
+        return logits 
 
-        return x
+def custom_loss(pred, target, answers):
+    # パディングされた部分（-1）をマスク
+    mask = (answers != -1).float()
+    
+    # クロスエントロピー損失を計算
+    loss = F.cross_entropy(pred, target, reduction='none')
+    
+    # マスクを適用して、パディングされた部分の損失を0にする
+    masked_loss = loss * mask.any(dim=1).float()
+    
+    # 有効な回答の平均損失を返す
+    return masked_loss.sum() / mask.any(dim=1).sum()
 
-
-# 4. 学習の実装
-def train(model, dataloader, optimizer, criterion, device):
+def train(model, dataloader, optimizer, device):
     model.train()
-
     total_loss = 0
     total_acc = 0
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+    for i, (image, question, answers, mode_answer) in enumerate(dataloader):
+        if i % 200 == 0:
+            print(f"{i} / {len(dataloader)}")
+        image, answers, mode_answer = image.to(device), answers.to(device), mode_answer.to(device)
 
         pred = model(image, question)
-        loss = criterion(pred, mode_answer.squeeze())
+        loss = custom_loss(pred, mode_answer, answers)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
-        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
+        total_acc += VQA_criterion(pred.argmax(1), answers)
+        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
-def eval(model, dataloader, optimizer, criterion, device):
-    model.eval()
+# def eval(model, dataloader, device):
+#     model.eval()
+#     total_loss = 0
+#     total_acc = 0
+#     simple_acc = 0
 
+#     start = time.time()
+#     with torch.no_grad():
+#         for batch in dataloader:
+#             if len(batch) == 4:  # 訓練データの場合
+#                 image, question, answers, mode_answer = batch
+#                 image, answers, mode_answer = image.to(device), answers.to(device), mode_answer.to(device)
+
+#                 pred = model(image, question)
+#                 loss = custom_loss(pred, mode_answer, answers)
+
+#                 total_loss += loss.item()
+#                 total_acc += VQA_criterion(pred.argmax(1), answers)
+#                 simple_acc += (pred.argmax(1) == mode_answer).mean().item()
+#             else:  # テストデータの場合
+#                 image, question = batch
+#                 image = image.to(device)
+
+#                 pred = model(image, question)
+
+#     if len(batch) == 4:  # 訓練データの場合のみ平均を計算
+#         num_batches = len(dataloader)
+#         return total_loss / num_batches, total_acc / num_batches, simple_acc / num_batches, time.time() - start
+#     else:  # テストデータの場合
+#         return 0, 0, 0, time.time() - start
+
+def eval(model, dataloader, device):
+    model.eval()
     total_loss = 0
     total_acc = 0
     simple_acc = 0
-
+    total_samples = 0
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
-        pred = model(image, question)
-        loss = criterion(pred, mode_answer.squeeze())
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            if len(batch) == 4:  # 訓練/検証データの形式（画像、質問、回答、最頻値の回答）
+                image, question, answers, mode_answer = batch
+                image, answers, mode_answer = image.to(device), answers.to(device), mode_answer.to(device)
+                
+                pred = model(image, question)
+                loss = custom_loss(pred, mode_answer, answers)
+                
+                total_loss += loss.item() * len(image)
+                total_acc += VQA_criterion(pred.argmax(1), answers) * len(image)
+                simple_acc += (pred.argmax(1) == mode_answer).float().sum().item()
+                total_samples += len(image)
+            else:  # テストデータの形式（画像、質問）
+                image, question = batch
+                image = image.to(device)
+                
+                pred = model(image, question)
+                # テストデータには正解がないため、損失や精度は計算しない
+                total_samples += len(image)
 
-        total_loss += loss.item()
-        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).mean().item()  # simple accuracy
+    eval_time = time.time() - start
+    
+    if total_samples > 0:
+        avg_loss = total_loss / total_samples
+        avg_acc = total_acc / total_samples
+        avg_simple_acc = simple_acc / total_samples
+        return avg_loss, avg_acc, avg_simple_acc, eval_time
+    else:
+        return 0, 0, 0, eval_time
+def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
+    total_acc = 0.
+    batch_size = batch_pred.size(0)
 
-    return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
+    for pred, answers in zip(batch_pred, batch_answers):
+        valid_answers = answers[answers != -1]  # パディングを除外
+        if len(valid_answers) == 0:
+            continue  # 有効な回答がない場合はスキップ
 
+        acc = 0.
+        num_match = (pred == valid_answers).sum().item()
+        acc = min(num_match / 3, 1)
+        total_acc += acc
+
+    return total_acc / batch_size
+
+def custom_collate(batch):
+    if len(batch[0]) == 4:  # 訓練データの場合
+        images, questions, answers, mode_answers = zip(*batch)
+        
+        images = torch.stack(images, 0)
+        questions = list(questions)
+        
+        max_len = max(len(a) for a in answers)
+        padded_answers = [torch.cat([a, torch.full((max_len - len(a),), -1, dtype=a.dtype)]) for a in answers]
+        answers = torch.stack(padded_answers)
+        
+        mode_answers = torch.tensor(mode_answers)
+        
+        return images, questions, answers, mode_answers
+    else:  # テストデータの場合
+        images, questions = zip(*batch)
+        
+        images = torch.stack(images, 0)
+        questions = list(questions)
+        
+        return images, questions
 
 def main():
-    # deviceの設定
+    # WandBの初期化
+    wandb.init(project="vqa-project")
+    wandb.config.update({
+        "model": "VQAModel",
+        "optimizer": "Adam",
+        "learning_rate": 0.0001,
+        "weight_decay": 1e-5,
+        "batch_size": 64,
+        "num_epochs": 50,
+        "patience": 5,
+    })
+
     set_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # dataloader / model
-    transform = transforms.Compose([
+    # データ拡張を含む画像の前処理
+    train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
-    test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+    val_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=train_transform)
+    val_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=val_transform, answer=False)
+    
+    val_dataset.update_dict(train_dataset)
 
-    # optimizer / criterion
-    num_epoch = 20
+    train_loader = DataLoader(train_dataset, batch_size=wandb.config.batch_size, shuffle=True, collate_fn=custom_collate)
+    val_loader = DataLoader(val_dataset, batch_size=wandb.config.batch_size, shuffle=False, collate_fn=custom_collate)
+
+    model = VQAModel(n_answer=len(train_dataset.answer2idx)).to(device)
+    
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=wandb.config.learning_rate, weight_decay=wandb.config.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
 
-    # train model
-    for epoch in range(num_epoch):
-        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
-        print(f"【{epoch + 1}/{num_epoch}】\n"
-              f"train time: {train_time:.2f} [s]\n"
-              f"train loss: {train_loss:.4f}\n"
-              f"train acc: {train_acc:.4f}\n"
-              f"train simple acc: {train_simple_acc:.4f}")
+    best_train_acc = 0
+    patience_counter = 0
+    
+    for epoch in range(wandb.config.num_epochs):
+        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, device)
+        val_loss, val_acc, val_simple_acc, val_time = eval(model, val_loader, device)
+        
+        scheduler.step(val_acc)
+        
+        # WandBにログを記録
+        wandb.log({
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "train_simple_acc": train_simple_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "val_simple_acc": val_simple_acc,
+            "learning_rate": optimizer.param_groups[0]['lr']
+        })
+        
+        print(f"【{epoch + 1}/{wandb.config.num_epochs}】")
+        print(f"train time: {train_time:.2f}")
+        print(f"train loss: {train_loss:.4f}")
+        print(f"train acc: {train_acc:.4f}")
+        print(f"train simple acc: {train_simple_acc:.4f}")
+        
+        # Early stopping
+        if train_acc > best_train_acc:
+            best_train_acc = train_acc
+            patience_counter = 0
+            torch.save(model.state_dict(), "best_model.pth")
+            print("Saved new best model")
+        else:
+            patience_counter += 1
+            if patience_counter >= wandb.config.patience:
+                print(f"Early stopping triggered after {epoch + 1} epochs")
+                break
 
-    # 提出用ファイルの作成
+    # # 最良のモデルを読み込む
+    # model.load_state_dict(torch.load("best_model.pth"))
+    
+    # 検証データに対する最終予測（提出用）
     model.eval()
     submission = []
-    for image, question in test_loader:
-        image, question = image.to(device), question.to(device)
-        pred = model(image, question)
-        pred = pred.argmax(1).cpu().item()
-        submission.append(pred)
+    with torch.no_grad():
+        for image, question in tqdm(val_loader, desc="Generating predictions"):
+            image = image.to(device)
+            pred = model(image, question)
+            pred = pred.argmax(1).cpu()
+            submission.extend(pred.tolist())
 
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
-    torch.save(model.state_dict(), "model.pth")
     np.save("submission.npy", submission)
+
+    # WandBのartifactとしてモデルを保存
+    wandb.save("best_model.pth")
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
