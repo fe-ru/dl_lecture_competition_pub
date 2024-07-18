@@ -42,7 +42,7 @@ class JapaneseBERTEncoder:
         self.model.eval()
 
     def encode(self, sentences, device='cuda'):
-        self.model = self.model.to(device)  # モデルを指定されたデバイスに移動
+        self.model = self.model.to(device) 
         encoded_input = self.tokenizer(sentences, padding=True, truncation=True, max_length=512, return_tensors='pt')
         encoded_input = {k: v.to(device) for k, v in encoded_input.items()}  # 入力をデバイスに移動
         with torch.no_grad():
@@ -348,12 +348,11 @@ def eval(model, dataloader, device):
                 total_acc += VQA_criterion(pred.argmax(1), answers) * len(image)
                 simple_acc += (pred.argmax(1) == mode_answer).float().sum().item()
                 total_samples += len(image)
-            else:  # テストデータの形式（画像、質問）
+            else:  
                 image, question = batch
                 image = image.to(device)
                 
                 pred = model(image, question)
-                # テストデータには正解がないため、損失や精度は計算しない
                 total_samples += len(image)
 
     eval_time = time.time() - start
